@@ -9,16 +9,34 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Restore Files from WebDAV
-        continue-on-error: true
+      - name: Install Rclone
         run: |
           Invoke-WebRequest "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "C:\rclone.zip"
           Expand-Archive "C:\rclone.zip" -DestinationPath "C:\rclone" -Force
-          $rclone = Get-ChildItem "C:\rclone" -Recurse -Filter "rclone.exe" | Select-Object -First 1
+          $rclonePath = (Get-ChildItem "C:\rclone" -Recurse -Filter "rclone.exe" | Select-Object -First 1).DirectoryName
+          echo "C:\rclone\$rclonePath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "$rclonePath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Obscure WebDAV Password
+        shell: pwsh
+        env:
+          RAW_PASSWORD: ${{ secrets.WEBDAV_PASS }}
+        run: |
+          $rcloneExe = (Get-ChildItem "C:\rclone" -Recurse -Filter "rclone.exe" | Select-Object -First 1).FullName
+          $obscured = & $rcloneExe obscure "$env:RAW_PASSWORD"
+          if ($LASTEXITCODE -ne 0) {
+            throw "rclone obscure failed"
+          }
+          "WEBDAV_PASSWORD=$obscured" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Restore Files from WebDAV
+        continue-on-error: true
+        run: |
+          $rcloneExe = (Get-ChildItem "C:\rclone" -Recurse -Filter "rclone.exe" | Select-Object -First 1).FullName
           $env:RCLONE_CONFIG = "C:\rclone.conf"
-          Set-Content -Path "C:\rclone.conf" -Value "[webdav]`ntype = webdav`nurl = ${{ secrets.WEBDAV_URL }}`nvendor = other`nuser = ${{ secrets.WEBDAV_USER }}`npass = ${{ secrets.WEBDAV_PASS }}"
+          Set-Content -Path "C:\rclone.conf" -Value "[webdav]`ntype = webdav`nurl = ${{ secrets.WEBDAV_URL }}`nvendor = other`nuser = ${{ secrets.WEBDAV_USER }}`npass = $env:WEBDAV_PASSWORD"
           New-Item -ItemType Directory -Force -Path "C:\Users\${{ secrets.ADMIN_USERNAME }}\Desktop"
-          & $rclone.FullName copy webdav: "C:\Users\${{ secrets.ADMIN_USERNAME }}\Desktop" --create-empty-src-dirs
+          & $rcloneExe copy webdav: "C:\Users\${{ secrets.ADMIN_USERNAME }}\Desktop" --create-empty-src-dirs
 
       - name: Enable Remote Desktop & Firewall
         run: |
@@ -65,7 +83,7 @@ jobs:
       - name: Backup Files to WebDAV
         if: always()
         run: |
+          $rcloneExe = (Get-ChildItem "C:\rclone" -Recurse -Filter "rclone.exe" | Select-Object -First 1).FullName
           $env:RCLONE_CONFIG = "C:\rclone.conf"
-          Set-Content -Path "C:\rclone.conf" -Value "[webdav]`ntype = webdav`nurl = ${{ secrets.WEBDAV_URL }}`nvendor = other`nuser = ${{ secrets.WEBDAV_USER }}`npass = ${{ secrets.WEBDAV_PASS }}"
-          $rclone = Get-ChildItem "C:\rclone" -Recurse -Filter "rclone.exe" | Select-Object -First 1
-          & $rclone.FullName copy "C:\Users\${{ secrets.ADMIN_USERNAME }}\Desktop" webdav: --create-empty-src-dirs
+          Set-Content -Path "C:\rclone.conf" -Value "[webdav]`ntype = webdav`nurl = ${{ secrets.WEBDAV_URL }}`nvendor = other`nuser = ${{ secrets.WEBDAV_USER }}`npass = $env:WEBDAV_PASSWORD"
+          & $rcloneExe copy "C:\Users\${{ secrets.ADMIN_USERNAME }}\Desktop" webdav: --create-empty-src-dirs
