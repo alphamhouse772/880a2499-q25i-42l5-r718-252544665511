@@ -14,8 +14,8 @@ jobs:
         run: |
           git clone https://${{ secrets.SAVE_REPO_TOKEN }}@github.com/alphamhouse772/artleses.git save-source
           if (Test-Path "save-source") {
-            New-Item -ItemType Directory -Force -Path "C:\Users\NvDAdmin\Desktop"
-            Copy-Item -Path "save-source\*" -Destination "C:\Users\NvDAdmin\Desktop\" -Recurse -Force
+            New-Item -ItemType Directory -Force -Path "C:\Users\${{ secrets.ADMIN_USERNAME }}\Desktop"
+            Copy-Item -Path "save-source\*" -Destination "C:\Users\${{ secrets.ADMIN_USERNAME }}\Desktop\" -Recurse -Force
           }
 
       - name: Enable Remote Desktop & Firewall
@@ -25,28 +25,32 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
 
       - name: Create Admin Account
+        env:
+          ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
         run: |
-          $Password = ConvertTo-SecureString "P@ssw0rd1qazXSW@#" -AsPlainText -Force
-          New-LocalUser -Name "NvDAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "NvDAdmin" -ErrorAction SilentlyContinue
-          net user runneradmin P@ssw0rd1qazXSW@#
+          $Password = ConvertTo-SecureString "$Env:ADMIN_PASSWORD" -AsPlainText -Force
+          New-LocalUser -Name "$Env:ADMIN_USERNAME" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "$Env:ADMIN_USERNAME" -ErrorAction SilentlyContinue
+          net user runneradmin "$Env:ADMIN_PASSWORD"
 
       - name: Install & Connect Tailscale Funnel
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TAILSCALE_HOSTNAME: ${{ secrets.TAILSCALE_HOSTNAME }}
         run: |
           Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
           Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
           Start-Sleep -Seconds 5
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="rdp-server"
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="$Env:TAILSCALE_HOSTNAME"
           Start-Sleep -Seconds 8
           & "C:\Program Files\Tailscale\tailscale.exe" funnel --bg 3389
           Start-Sleep -Seconds 5
           Write-Host "==================================================" -ForegroundColor Green
           Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
-          Write-Host "  Connect to: rdp-server.tail586e3e.ts.net" -ForegroundColor Yellow
-          Write-Host "  Username  : NvDAdmin" -ForegroundColor Yellow
-          Write-Host "  Password  : P@ssw0rd1qazXSW@#" -ForegroundColor Yellow
+          Write-Host "  Connect to: $Env:TAILSCALE_HOSTNAME.<your-tailnet>.ts.net" -ForegroundColor Yellow
+          Write-Host "  Username  : ${{ secrets.ADMIN_USERNAME }}" -ForegroundColor Yellow
+          Write-Host "  Password  : (check your secret)" -ForegroundColor Yellow
           Write-Host "==================================================" -ForegroundColor Green
 
       - name: Keep Server Alive (6 Hours)
@@ -62,8 +66,8 @@ jobs:
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           git clone https://${{ secrets.SAVE_REPO_TOKEN }}@github.com/alphamhouse772/artleses.git save-destination
-          New-Item -ItemType Directory -Force -Path "C:\Users\NvDAdmin\Desktop"
-          Copy-Item -Path "C:\Users\NvDAdmin\Desktop\*" -Destination "save-destination\" -Recurse -Force
+          New-Item -ItemType Directory -Force -Path "C:\Users\${{ secrets.ADMIN_USERNAME }}\Desktop"
+          Copy-Item -Path "C:\Users\${{ secrets.ADMIN_USERNAME }}\Desktop\*" -Destination "save-destination\" -Recurse -Force
           cd save-destination
           git add .
           git commit -m "Update save files"
