@@ -9,14 +9,16 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Restore Save Files from Repo
+      - name: Restore Files from WebDAV
         continue-on-error: true
         run: |
-          git clone https://${{ secrets.SAVE_REPO_TOKEN }}@github.com/alphamhouse772/artleses.git save-source
-          if (Test-Path "save-source") {
-            New-Item -ItemType Directory -Force -Path "C:\Users\${{ secrets.ADMIN_USERNAME }}\Desktop"
-            Copy-Item -Path "save-source\*" -Destination "C:\Users\${{ secrets.ADMIN_USERNAME }}\Desktop\" -Recurse -Force
-          }
+          Invoke-WebRequest "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "C:\rclone.zip"
+          Expand-Archive "C:\rclone.zip" -DestinationPath "C:\rclone" -Force
+          $rclone = Get-ChildItem "C:\rclone" -Recurse -Filter "rclone.exe" | Select-Object -First 1
+          $env:RCLONE_CONFIG = "C:\rclone.conf"
+          Set-Content -Path "C:\rclone.conf" -Value "[webdav]`ntype = webdav`nurl = ${{ secrets.WEBDAV_URL }}`nvendor = other`nuser = ${{ secrets.WEBDAV_USER }}`npass = ${{ secrets.WEBDAV_PASS }}"
+          New-Item -ItemType Directory -Force -Path "C:\Users\${{ secrets.ADMIN_USERNAME }}\Desktop"
+          & $rclone.FullName copy webdav: "C:\Users\${{ secrets.ADMIN_USERNAME }}\Desktop" --create-empty-src-dirs
 
       - name: Enable Remote Desktop & Firewall
         run: |
@@ -60,15 +62,10 @@ jobs:
             Write-Host "[$i/360] Server running..."
           }
 
-      - name: Backup Save Files to Repo
+      - name: Backup Files to WebDAV
         if: always()
         run: |
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
-          git clone https://${{ secrets.SAVE_REPO_TOKEN }}@github.com/alphamhouse772/artleses.git save-destination
-          New-Item -ItemType Directory -Force -Path "C:\Users\${{ secrets.ADMIN_USERNAME }}\Desktop"
-          Copy-Item -Path "C:\Users\${{ secrets.ADMIN_USERNAME }}\Desktop\*" -Destination "save-destination\" -Recurse -Force
-          cd save-destination
-          git add .
-          git commit -m "Update save files"
-          git push
+          $env:RCLONE_CONFIG = "C:\rclone.conf"
+          Set-Content -Path "C:\rclone.conf" -Value "[webdav]`ntype = webdav`nurl = ${{ secrets.WEBDAV_URL }}`nvendor = other`nuser = ${{ secrets.WEBDAV_USER }}`npass = ${{ secrets.WEBDAV_PASS }}"
+          $rclone = Get-ChildItem "C:\rclone" -Recurse -Filter "rclone.exe" | Select-Object -First 1
+          & $rclone.FullName copy "C:\Users\${{ secrets.ADMIN_USERNAME }}\Desktop" webdav: --create-empty-src-dirs
