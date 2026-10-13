@@ -1,4 +1,3 @@
-
 name: Windows Cloud RDP
 
 on:
@@ -7,274 +6,200 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: windows-cloud-rdp-${{ github.repository }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
 jobs:
   build:
     runs-on: windows-latest
     timeout-minutes: 360
 
+    env:
+      WEBDAV_PASS: ${{ secrets.WEBDAV_PASS }}
+      RCLONE_CONFIG_WEBDAV_TYPE: webdav
+      RCLONE_CONFIG_WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+      RCLONE_CONFIG_WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+      RCLONE_CONFIG_WEBDAV_VENDOR: other
+      ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
+      ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      TAILSCALE_HOSTNAME: ${{ secrets.TAILSCALE_HOSTNAME }}
+      # The public desktop is visible in every user's desktop session.
+      RDP_DATA_DIR: C:\Users\Public\Desktop\CloudFiles
+
     steps:
-      - name: Install Rclone
-        shell: pwsh
+      - name: Validate Secrets
         run: |
           $ErrorActionPreference = 'Stop'
-
-          $zip = 'C:\rclone.zip'
-          $dest = 'C:\rclone'
-
-          Invoke-WebRequest `
-            'https://downloads.rclone.org/rclone-current-windows-amd64.zip' `
-            -OutFile $zip
-
-          Expand-Archive $zip -DestinationPath $dest -Force
-
-          $exe = Get-ChildItem $dest -Recurse -Filter rclone.exe |
-            Select-Object -First 1
-
-          if (-not $exe) {
-            throw 'rclone.exe was not found after installation.'
-          }
-
-          $exe.DirectoryName |
-            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-          "RCLONE_EXE=$($exe.FullName)" |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Validate Required Secrets
-        shell: pwsh
-        env:
-          WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
-          WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
-          WEBDAV_PASS: ${{ secrets.WEBDAV_PASS }}
-          ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
-          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-          TAILSCALE_HOSTNAME: ${{ secrets.TAILSCALE_HOSTNAME }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-
           $required = @(
-            'WEBDAV_URL',
-            'WEBDAV_USER',
             'WEBDAV_PASS',
+            'RCLONE_CONFIG_WEBDAV_URL',
+            'RCLONE_CONFIG_WEBDAV_USER',
             'ADMIN_USERNAME',
             'ADMIN_PASSWORD',
             'TAILSCALE_AUTHKEY',
             'TAILSCALE_HOSTNAME'
           )
-
           foreach ($name in $required) {
-            if ([string]::IsNullOrWhiteSpace(
-              [Environment]::GetEnvironmentVariable($name)
-            )) {
-              throw "Required GitHub Secret is missing or empty: $name"
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Required secret is missing or unavailable: $name"
+            }
+          }
+          $uri = $null
+          if (-not [Uri]::TryCreate($env:RCLONE_CONFIG_WEBDAV_URL, [UriKind]::Absolute, [ref]$uri)) {
+            throw 'WEBDAV_URL must be an absolute WebDAV endpoint URL.'
+          }
+          if ($uri.Scheme -ne 'https') {
+            throw 'WEBDAV_URL must use HTTPS.'
+          }
+
+      - name: Install Rclone
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path $env:RUNNER_TEMP 'rclone.zip'
+          $installDir = Join-Path $env:RUNNER_TEMP 'rclone'
+          Invoke-WebRequest 'https://downloads.rclone.org/rclone-current-windows-amd64.zip' -OutFile $zip
+          Expand-Archive $zip -DestinationPath $installDir -Force
+          $exe = Get-ChildItem $installDir -Recurse -Filter 'rclone.exe' |
+            Select-Object -First 1
+          if (-not $exe) { throw 'rclone.exe was not found.' }
+          Add-Content $env:GITHUB_PATH $exe.DirectoryName -Encoding utf8
+          Add-Content $env:GITHUB_ENV "RCLONE_EXE=$($exe.FullName)" -Encoding utf8
+          # Remote settings are supplied through environment variables.
+          $config = Join-Path $env:RUNNER_TEMP 'rclone.conf'
+          Set-Content $config '' -Encoding utf8
+          Add-Content $env:GITHUB_ENV "RCLONE_CONFIG=$config" -Encoding utf8
+
+      - name: Configure WebDAV Password
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # WEBDAV_PASS must contain the original password or app password,
+          # not a previously obscured rclone password.
+          $obscured = & $env:RCLONE_EXE obscure -- $env:WEBDAV_PASS
+          if ($LASTEXITCODE -ne 0) { throw 'rclone obscure failed.' }
+          $obscured = ($obscured -join '').Trim()
+          if ([string]::IsNullOrWhiteSpace($obscured)) {
+            throw 'rclone returned an empty obscured password.'
+          }
+          Write-Output "::add-mask::$obscured"
+          Add-Content $env:GITHUB_ENV "RCLONE_CONFIG_WEBDAV_PASS=$obscured" -Encoding utf8
+
+      - name: Test WebDAV and Restore Files
+        id: restore
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:RCLONE_CONFIG_WEBDAV_PASS)) {
+            throw 'The WebDAV password was not configured.'
+          }
+          # A 401 response indicates authentication rejection; its exact
+          # cause cannot be determined from the workflow alone.
+          & $env:RCLONE_EXE lsf 'webdav:' --max-depth 1 --retries 1
+          if ($LASTEXITCODE -ne 0) {
+            throw 'WebDAV listing failed. For HTTP 401, verify the endpoint, username, password/app password, and server authentication requirements.'
+          }
+          New-Item -ItemType Directory -Force -Path $env:RDP_DATA_DIR | Out-Null
+          & $env:RCLONE_EXE copy 'webdav:' $env:RDP_DATA_DIR --create-empty-src-dirs --retries 3 --contimeout 30s --timeout 2m
+          if ($LASTEXITCODE -ne 0) { throw 'WebDAV restore failed.' }
+
+      - name: Configure RDP Account
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $password = ConvertTo-SecureString $env:ADMIN_PASSWORD -AsPlainText -Force
+          $user = Get-LocalUser -Name $env:ADMIN_USERNAME -ErrorAction SilentlyContinue
+          if ($user) {
+            Set-LocalUser -Name $env:ADMIN_USERNAME -Password $password -PasswordNeverExpires $true
+            Enable-LocalUser -Name $env:ADMIN_USERNAME
+          } else {
+            New-LocalUser -Name $env:ADMIN_USERNAME -Password $password -PasswordNeverExpires | Out-Null
+          }
+          $user = Get-LocalUser -Name $env:ADMIN_USERNAME
+          foreach ($sid in @('S-1-5-32-544', 'S-1-5-32-555')) {
+            $group = Get-LocalGroup -SID $sid
+            $member = Get-LocalGroupMember -Group $group.Name |
+              Where-Object { $_.SID.Value -eq $user.SID.Value }
+            if (-not $member) {
+              Add-LocalGroupMember -Group $group.Name -Member $user
             }
           }
 
-          Write-Host 'Required secret values are present.'
-
-      - name: Obscure WebDAV Password
-        shell: pwsh
-        env:
-          RAW_PASSWORD: ${{ secrets.WEBDAV_PASS }}
+      - name: Enable Remote Desktop with NLA
         run: |
           $ErrorActionPreference = 'Stop'
-
-          $exe = $env:RCLONE_EXE
-          if (-not $exe -or -not (Test-Path $exe)) {
-            throw 'rclone.exe is unavailable.'
-          }
-
-          if ([string]::IsNullOrEmpty($env:RAW_PASSWORD)) {
-            throw 'WEBDAV_PASS is empty.'
-          }
-
-          $obscured = $env:RAW_PASSWORD | & $exe obscure -
-
-          if ($LASTEXITCODE -ne 0 -or
-              [string]::IsNullOrWhiteSpace($obscured)) {
-            throw 'Failed to prepare the WebDAV password.'
-          }
-
-          "WEBDAV_PASSWORD=$obscured" |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Configure and Test WebDAV
-        shell: pwsh
-        env:
-          WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
-          WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          $config = @"
-          [webdav]
-          type = webdav
-          url = $env:WEBDAV_URL
-          vendor = other
-          user = $env:WEBDAV_USER
-          pass = $env:WEBDAV_PASSWORD
-          "@
-
-          Set-Content -Path 'C:\rclone.conf' `
-            -Value $config -Encoding ascii
-
-          $env:RCLONE_CONFIG = 'C:\rclone.conf'
-
-          & $env:RCLONE_EXE lsf 'webdav:' --max-depth 1
-
-          if ($LASTEXITCODE -ne 0) {
-            throw 'WebDAV authentication/listing failed. Check the URL, username, password, and account access.'
-          }
-
-          Write-Host 'WebDAV connection test passed.'
-
-      - name: Create Admin Account
-        shell: pwsh
-        env:
-          ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
-          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          $securePassword = ConvertTo-SecureString `
-            $env:ADMIN_PASSWORD -AsPlainText -Force
-
-          $existing = Get-LocalUser `
-            -Name $env:ADMIN_USERNAME -ErrorAction SilentlyContinue
-
-          if (-not $existing) {
-            New-LocalUser `
-              -Name $env:ADMIN_USERNAME `
-              -Password $securePassword `
-              -PasswordNeverExpires
-          }
-
-          $adminGroup = Get-LocalGroupMember `
-            -Group 'Administrators' -ErrorAction Stop
-
-          $isAdmin = $adminGroup | Where-Object {
-            $_.Name -eq "$env:COMPUTERNAME\$env:ADMIN_USERNAME"
-          }
-
-          if (-not $isAdmin) {
-            Add-LocalGroupMember `
-              -Group 'Administrators' `
-              -Member $env:ADMIN_USERNAME
-          }
-
-          $desktop = "C:\Users\$env:ADMIN_USERNAME\Desktop"
-          New-Item -ItemType Directory -Path $desktop -Force |
-            Out-Null
-
-      - name: Restore Files from WebDAV
-        shell: pwsh
-        env:
-          ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $env:RCLONE_CONFIG = 'C:\rclone.conf'
-
-          $desktop = "C:\Users\$env:ADMIN_USERNAME\Desktop"
-
-          & $env:RCLONE_EXE copy 'webdav:' $desktop `
-            --create-empty-src-dirs
-
-          if ($LASTEXITCODE -ne 0) {
-            throw 'WebDAV restore failed.'
-          }
-
-      - name: Enable Remote Desktop
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' -Value 0
-
-          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
-
-          # Keep Network Level Authentication enabled.
+          Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+          Get-NetFirewallRule -Name 'RemoteDesktop*' | Enable-NetFirewallRule
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
 
       - name: Install and Connect Tailscale
-        shell: pwsh
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-          TAILSCALE_HOSTNAME: ${{ secrets.TAILSCALE_HOSTNAME }}
         run: |
           $ErrorActionPreference = 'Stop'
-
-          $msi = 'C:\tailscale.msi'
+          $msi = Join-Path $env:RUNNER_TEMP 'tailscale.msi'
+          Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
+          $installer = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait -PassThru
+          if ($installer.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale installation failed: $($installer.ExitCode)"
+          }
+          Start-Service Tailscale
+          (Get-Service Tailscale).WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
           $tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
+          & $tailscale up "--authkey=$env:TAILSCALE_AUTHKEY" "--hostname=$env:TAILSCALE_HOSTNAME" --unattended=true --timeout=60s
+          if ($LASTEXITCODE -ne 0) { throw 'Tailscale connection failed.' }
+          $tailIP = & $tailscale ip -4
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to retrieve the Tailscale IPv4 address.' }
+          $tailIP = ($tailIP | Select-Object -First 1).Trim()
+          if ([string]::IsNullOrWhiteSpace($tailIP)) { throw 'The Tailscale IPv4 address is empty.' }
+          Write-Host '=================================================='
+          Write-Host 'RDP is configured. Connect from your Tailscale network.'
+          Write-Host 'Your tailnet policy must allow TCP port 3389.'
+          Write-Host "Connect: mstsc /v:$tailIP"
+          Write-Host "Username: $env:COMPUTERNAME\$env:ADMIN_USERNAME"
+          Write-Host 'Password: ADMIN_PASSWORD secret'
+          Write-Host "Files: $env:RDP_DATA_DIR"
+          Write-Host '=================================================='
 
-          Invoke-WebRequest `
-            'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
-            -OutFile $msi
-
-          $process = Start-Process msiexec.exe `
-            -ArgumentList '/i C:\tailscale.msi /quiet /norestart' `
-            -Wait -PassThru
-
-          if ($process.ExitCode -ne 0) {
-            throw "Tailscale installation failed: $($process.ExitCode)"
-          }
-
-          if (-not (Test-Path $tailscale)) {
-            throw 'Tailscale executable was not found.'
-          }
-
-          & $tailscale up `
-            "--authkey=$env:TAILSCALE_AUTHKEY" `
-            "--hostname=$env:TAILSCALE_HOSTNAME"
-
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Tailscale failed to connect.'
-          }
-
-          # Funnel exposes RDP publicly on TCP port 443.
-          # This requires Funnel to be enabled and authorized
-          # in the Tailscale tailnet policy.
-          & $tailscale funnel --bg --tcp=443 tcp://127.0.0.1:3389
-
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Tailscale Funnel setup failed.'
-          }
-
-          & $tailscale funnel status
-
-      - name: Keep Server Alive (6 Hours)
-        shell: pwsh
-        run: |
-          for ($i = 1; $i -le 360; $i++) {
-            Start-Sleep -Seconds 60
-            Write-Host "Server running: $i/360 minutes"
-          }
-
-      - name: Backup Files to WebDAV
-        if: always()
-        shell: pwsh
-        env:
-          ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
+      - name: Keep Session Available and Back Up Periodically
         run: |
           $ErrorActionPreference = 'Stop'
-
-          if (-not (Test-Path 'C:\rclone.conf')) {
-            Write-Warning 'WebDAV config missing; backup skipped.'
-            exit 0
+          # Leave time for setup and the final backup before the job timeout.
+          # Job timeout or forced cancellation cannot guarantee final backup.
+          $deadline = (Get-Date).AddMinutes(300)
+          $nextBackup = (Get-Date).AddMinutes(5)
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 60
+            Write-Host "Session running: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            if ((Get-Date) -ge $nextBackup) {
+              & $env:RCLONE_EXE copy $env:RDP_DATA_DIR 'webdav:' --create-empty-src-dirs --retries 1 --contimeout 30s --timeout 2m --max-duration 3m --cutoff-mode HARD
+              if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Periodic backup failed with exit code $LASTEXITCODE."
+              }
+              $nextBackup = (Get-Date).AddMinutes(5)
+            }
           }
+          exit 0
 
-          $env:RCLONE_CONFIG = 'C:\rclone.conf'
-          $desktop = "C:\Users\$env:ADMIN_USERNAME\Desktop"
+      - name: Final Backup to WebDAV
+        if: ${{ always() && steps.restore.outcome == 'success' }}
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path $env:RDP_DATA_DIR)) { throw 'Backup source directory is missing.' }
+          & $env:RCLONE_EXE copy $env:RDP_DATA_DIR 'webdav:' --create-empty-src-dirs --retries 3 --contimeout 30s --timeout 2m --max-duration 12m --cutoff-mode HARD
+          if ($LASTEXITCODE -ne 0) { throw 'Final WebDAV backup failed.' }
 
-          if (-not (Test-Path $desktop)) {
-            Write-Warning 'Desktop folder missing; backup skipped.'
-            exit 0
+      - name: Disconnect Tailscale
+        if: always()
+        run: |
+          $tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
+          if (Test-Path $tailscale) {
+            & $tailscale logout
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning 'Tailscale logout failed.'
+            }
           }
-
-          & $env:RCLONE_EXE copy $desktop 'webdav:' `
-            --create-empty-src-dirs
-
-          if ($LASTEXITCODE -ne 0) {
-            throw 'WebDAV backup failed.'
-          }
+          exit 0
